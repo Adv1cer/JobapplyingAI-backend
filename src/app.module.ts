@@ -7,19 +7,21 @@ import { JobsModule } from './jobs/jobs.module';
 
 @Module({
   imports: [
+    
     ConfigModule.forRoot({ isGlobal: true }),
     TypeOrmModule.forRootAsync({
-      imports: [ConfigModule],
-      useFactory: (config: ConfigService) => ({
+    imports: [ConfigModule],
+    useFactory: (config: ConfigService) => {
+      const dbUrl = config.get<string>('DATABASE_URL');
+      const isExternalDb = dbUrl && (dbUrl.includes('render.com'));
+      return {
         type: 'postgres',
-        host: config.get('DB_HOST'),
-        port: config.get<number>('DB_PORT'),
-        username: config.get('DB_USERNAME'),
-        password: config.get('DB_PASSWORD'),
-        database: config.get('DB_NAME'),
+        url: config.get<string>('DATABASE_URL'),
         entities: [__dirname + '/**/*.entity{.ts,.js}'],
         synchronize: true,
-      }),
+        ssl: isExternalDb ? { rejectUnauthorized: false } : false,
+      };
+      },
       inject: [ConfigService],
     }),
     AuthModule,
