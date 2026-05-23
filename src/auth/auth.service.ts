@@ -34,8 +34,9 @@ export class AuthService {
     return this.sanitize(user);
   }
 
-  private signToken(sub: string, email: string) {
-    return this.jwtService.sign({ sub, email });
+  private signToken(id: string, email: string) {
+    // payload.id matches JwtStrategy's validate(payload: { id, email })
+    return this.jwtService.sign({ id, email });
   }
 
   private sanitize(user: any) {
