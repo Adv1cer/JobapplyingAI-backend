@@ -1,128 +1,148 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { Repository } from 'typeorm';
-import { JobMatch } from './job-match.entity';
+import { In, Repository } from 'typeorm';
+import { JobMatch } from './entities/job-match.entity';
+import { SavedJob } from './entities/saved-job.entity';
+import { Job } from './entities/job.entity';
+import { CoverLetterService, CoverLetterRequest } from '../ai/services/cover-letter.service';
+import { Resume } from '../resume/resume.entity';
+import { HrEmailService, HrContact } from '../scraping/hr-email.service';
 
 @Injectable()
 export class JobsService {
   constructor(
     @InjectRepository(JobMatch)
-    private readonly jobRepo: Repository<JobMatch>,
+    private readonly matchRepo: Repository<JobMatch>,
+    @InjectRepository(SavedJob)
+    private readonly savedJobRepo: Repository<SavedJob>,
+    @InjectRepository(Job)
+    private readonly jobRepo: Repository<Job>,
+    @InjectRepository(Resume)
+    private readonly resumeRepo: Repository<Resume>,
+    private readonly coverLetterService: CoverLetterService,
+    private readonly hrEmailService: HrEmailService,
   ) {}
 
   async getDashboardStats(userId: string) {
-    const total = await this.jobRepo.count({ where: { userId } });
-    const aiMatches = await this.jobRepo.count({
-      where: { userId, status: 'pending' },
-    });
-    const pendingReview = await this.jobRepo.count({
-      where: { userId, status: 'pending' },
-    });
-    const interviewRequests = await this.jobRepo.count({
-      where: { userId, status: 'interview' },
-    });
-
-    return {
-      totalScanned: total || 1482,
-      aiMatches: aiMatches || 24,
-      pendingReview: pendingReview || 8,
-      interviewRequests: interviewRequests || 3,
-    };
+    const [totalScanned, aiMatches, applied, interviewRequests] = await Promise.all([
+      this.matchRepo.count({ where: { userId } }),
+      this.matchRepo.count({ where: { userId, status: 'pending' } }),
+      this.matchRepo.count({ where: { userId, status: 'applied' } }),
+      this.matchRepo.count({ where: { userId, status: 'interview' } }),
+    ]);
+    return { totalScanned, aiMatches, pendingReview: aiMatches, applied, interviewRequests };
   }
 
   async getJobMatches(userId: string): Promise<JobMatch[]> {
-    const existing = await this.jobRepo.find({
+    return this.matchRepo.find({
       where: { userId },
-      order: { scrapedAt: 'DESC' },
+      order: { matchScore: 'DESC', scrapedAt: 'DESC' },
     });
-
-    if (existing.length > 0) return existing;
-
-    // Seed demo data for new users
-    const demoJobs = [
-      {
-        userId,
-        title: 'Senior Product Designer',
-        company: 'Linear Systems',
-        location: 'Remote, Global',
-        source: 'LinkedIn',
-        matchScore: 98,
-        coverLetter:
-          'Dear Hiring Manager,\n\nI am writing to express my strong interest in the Senior Product Designer position at Linear Systems. Having followed Linear\'s journey in the dev-tool space, I am particularly impressed by your focus on streamlined workflows...',
-        resumeName: 'Alex_Thompson_Design_Lead_2024.pdf',
-        resumeOptimizedFor: 'FinTech & SaaS roles',
-        status: 'pending',
-      },
-      {
-        userId,
-        title: 'UX Strategy Lead',
-        company: 'Meta Platforms',
-        location: 'London, UK (Hybrid)',
-        source: 'Facebook Jobs',
-        matchScore: 85,
-        coverLetter:
-          "To the Meta Recruitment Team,\n\nMeta's commitment to building the next generation of social connection aligns perfectly with my 8+ years of expertise in user-centered strategy. I have specialized in scaling complex design systems...",
-        resumeName: 'Alex_Thompson_Executive_Strategy.pdf',
-        resumeOptimizedFor: 'Leadership & Management',
-        status: 'pending',
-      },
-      {
-        userId,
-        title: 'Head of Digital Design',
-        company: 'PropertyGuru',
-        location: 'Singapore (On-site)',
-        source: 'JobDB',
-        matchScore: 72,
-        coverLetter:
-          "Dear PropertyGuru Talent Team,\n\nYour recent expansion into AI-driven property valuation tools is a fascinating move, and I am eager to bring my experience in digital design leadership to support this growth. In my previous role as Senior Designer...",
-        resumeName: 'Alex_Thompson_Design_Lead_2024.pdf',
-        resumeOptimizedFor: 'FinTech & SaaS roles',
-        status: 'pending',
-      },
-    ];
-
-    const saved = await this.jobRepo.save(demoJobs.map((j) => this.jobRepo.create(j)));
-    return saved;
   }
 
   async confirmApplication(userId: string, jobId: string): Promise<JobMatch> {
-    const job = await this.jobRepo.findOne({ where: { id: jobId, userId } });
+    const job = await this.matchRepo.findOne({ where: { id: jobId, userId } });
     if (!job) throw new NotFoundException('Job not found');
     job.status = 'applied';
-    return this.jobRepo.save(job);
+    return this.matchRepo.save(job);
   }
 
   async discardJob(userId: string, jobId: string): Promise<void> {
-    const job = await this.jobRepo.findOne({ where: { id: jobId, userId } });
+    const job = await this.matchRepo.findOne({ where: { id: jobId, userId } });
     if (!job) throw new NotFoundException('Job not found');
-    await this.jobRepo.remove(job);
+    job.status = 'discarded';
+    await this.matchRepo.save(job);
   }
 
-  async getActiveBots() {
-    return [
-      { id: 1, name: 'Product Roles (US)', frequency: 'Every 2h', matches: 12, active: true },
-      { id: 2, name: 'Design Lead (EU)', frequency: 'Daily', matches: 4, active: true },
-    ];
+  async saveJob(userId: string, jobId: string): Promise<SavedJob> {
+    const existing = await this.savedJobRepo.findOne({ where: { userId, jobId } });
+    if (existing) return existing;
+
+    const job = await this.jobRepo.findOne({ where: { id: jobId } });
+    return this.savedJobRepo.save(
+      this.savedJobRepo.create({
+        userId,
+        jobId,
+        title: job?.title,
+        company: job?.company,
+        url: job?.url,
+        source: job?.source,
+      }),
+    );
   }
 
-  async getUpcomingInterviews() {
-    return [
-      {
-        id: 1,
-        title: 'Senior Designer Interview',
-        company: 'Stripe',
-        date: '2026-09-14',
-        time: '14:00',
-        type: 'Zoom',
-      },
-      {
-        id: 2,
-        title: 'Initial Screening',
-        company: 'OpenAI',
-        date: '2026-09-16',
-        time: '09:30',
-        type: 'Call',
-      },
-    ];
+  async unsaveJob(userId: string, jobId: string): Promise<void> {
+    await this.savedJobRepo.delete({ userId, jobId });
   }
+
+  async getSavedJobs(userId: string): Promise<SavedJob[]> {
+    return this.savedJobRepo.find({
+      where: { userId },
+      relations: ['job'],
+      order: { savedAt: 'DESC' },
+    });
+  }
+
+  async regenerateCoverLetter(
+    userId: string,
+    jobMatchId: string,
+    language?: 'TH' | 'EN',
+  ): Promise<{ coverLetter: string }> {
+    const match = await this.matchRepo.findOne({ where: { id: jobMatchId, userId } });
+    if (!match) throw new NotFoundException('Job match not found');
+
+    const resume = await this.resumeRepo.findOne({ where: { userId } });
+    if (!resume) throw new NotFoundException('Resume not found');
+
+    const result = await this.coverLetterService.generate({
+      jobTitle: match.title,
+      company: match.company,
+      jobDescription: match.skills.join(', '),
+      resume,
+      language: language ?? 'TH',
+    } as CoverLetterRequest);
+
+    await this.matchRepo.update(jobMatchId, {
+      coverLetter: result.content,
+      coverLetterLang: result.language,
+    });
+
+    return { coverLetter: result.content };
+  }
+
+  async clearPendingJobs(userId: string): Promise<{ deleted: number }> {
+    const result = await this.matchRepo.delete({ userId, status: In(['pending', 'discarded']) });
+    return { deleted: result.affected ?? 0 };
+  }
+
+  async clearAllJobs(userId: string): Promise<{ deleted: number }> {
+    const result = await this.matchRepo.delete({ userId });
+    return { deleted: result.affected ?? 0 };
+  }
+
+  /**
+   * Look up HR / recruiter email addresses for a job's company.
+   * The job can be identified either by its internal UUID (jobMatchId)
+   * or by passing the company name directly.
+   */
+  async getHrEmails(
+    userId: string,
+    jobMatchId: string,
+  ): Promise<{ company: string; contacts: HrContact[] }> {
+    const match = await this.matchRepo.findOne({ where: { id: jobMatchId, userId } });
+    if (!match) throw new NotFoundException('Job match not found');
+
+    const contacts = await this.hrEmailService.lookup(match.company);
+
+    // Persist any found emails back to the job record if they're new
+    if (contacts.length > 0) {
+      const emails = contacts.map((c) => c.email);
+      await this.matchRepo.update(jobMatchId, { hrEmails: emails } as any);
+    }
+
+    return { company: match.company, contacts };
+  }
+
+  async getActiveBots(_userId: string) { return []; }
+  async getUpcomingInterviews(_userId: string) { return []; }
 }
