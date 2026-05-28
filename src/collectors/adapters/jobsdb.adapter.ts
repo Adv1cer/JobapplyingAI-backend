@@ -173,6 +173,30 @@ function extractJobsFromHtml(html: string): any[] {
   return [];
 }
 
+/**
+ * Parse the actual job posting date from a JobsDB item.
+ * JobsDB exposes several date fields — try each in order of reliability:
+ *   listingDate  — ISO string when the listing went live (most reliable)
+ *   postedAt     — alternative field name in some API versions
+ *   listedAt     — another alternative
+ * Returns an ISO string or undefined if nothing parseable is found.
+ */
+function parseJobsDBDate(it: any): string | undefined {
+  const candidates = [it.listingDate, it.postedAt, it.listedAt, it.createdAt];
+  for (const raw of candidates) {
+    if (!raw) continue;
+    // Could be ISO string, "YYYY-MM-DD", epoch ms (number), or relative string
+    let d: Date;
+    if (typeof raw === 'number') {
+      d = new Date(raw > 1e12 ? raw : raw * 1000); // handle both ms and s
+    } else {
+      d = new Date(raw);
+    }
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+  return undefined;
+}
+
 function normalizeItem(it: any): NormalizedJob | null {
   const id = it.id ?? it.jobId ?? it.listingId;
   if (!id) return null;
@@ -218,7 +242,7 @@ function normalizeItem(it: any): NormalizedJob | null {
     remote,
     url: `${BASE}/th/job/${id}`,
     hrEmails: [],
-    postedAt: it.listingDate,
+    postedAt: parseJobsDBDate(it),
     createdAt: new Date(),
   };
 }

@@ -16,8 +16,18 @@ export class JobsController {
   }
 
   @Get('matches')
-  getMatches(@Request() req: any) {
-    return this.jobsService.getJobMatches(req.user.id);
+  getMatches(
+    @Request() req: any,
+    @Query('page') page = '1',
+    @Query('limit') limit = '10',
+    @Query('includeExpired') includeExpired = 'false',
+  ) {
+    return this.jobsService.getJobMatches(
+      req.user.id,
+      Math.max(1, parseInt(page, 10) || 1),
+      Math.min(50, Math.max(1, parseInt(limit, 10) || 10)),
+      includeExpired === 'true',
+    );
   }
 
   @Get('saved')

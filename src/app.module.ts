@@ -14,6 +14,7 @@ import { AiModule } from './ai/ai.module';
 import { GmailModule } from './gmail/gmail.module';
 import { CollectorsModule } from './collectors/collectors.module';
 import { QueuesModule } from './queues/queues.module';
+import { ChatModule } from './chat/chat.module';
 
 @Module({
   imports: [
@@ -88,6 +89,7 @@ import { QueuesModule } from './queues/queues.module';
     GmailModule,
     CollectorsModule,
     QueuesModule,
+    ChatModule,
   ],
 })
 export class AppModule {}

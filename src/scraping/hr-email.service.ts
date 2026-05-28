@@ -1,27 +1,30 @@
 /**
- * HR Email Lookup — enhanced, free, no API key required.
+ * HR Email Lookup — AI-first, company-contact fallback
  *
  * Pipeline:
- *   Step 1 — Domain discovery: search "{company} official website" → extract company domain
- *   Step 2 — Email scraping: run 3 DDG queries to collect real email addresses
- *             a) "{company}" HR email recruiter Thailand
- *             b) "{company}" สมัครงาน ติดต่อ hr อีเมล
- *             c) site:{domain} contact OR careers (if domain found)
- *   Step 3 — Pattern detection: guess naming convention from found emails
- *             e.g. firstname.lastname@domain.com → infer more emails
- *   Step 4 — Scoring:
- *             • Email scraped from official company domain  → confidence 0.90
- *             • Email from job board / LinkedIn / social    → confidence 0.60
- *             • Email inferred from naming pattern          → confidence 0.40
- *   Step 5 — Deduplicate, sort by confidence, return top 5
+ *   Step 1 — Ask OpenRouter AI for HR + general contact emails (JSON only)
+ *   Step 2 — If AI returns nothing, fall back to DuckDuckGo scraping
+ *   Step 3 — Deduplicate, classify (hr | general), sort HR-first
+ *
+ * The caller always gets something useful:
+ *   - Best case: direct HR/recruiter email
+ *   - Fallback: general company contact email (contact@, info@, etc.)
+ *   - Last resort: empty array → frontend shows "ไม่พบ"
+ *
+ * Cached 24 h per company name.
  */
 import { Injectable, Logger } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import axios from 'axios';
 
 export interface HrContact {
-  email: string;
+  email?: string;
+  phone?: string;
+  website?: string;
   confidence: number;       // 0.0 – 1.0
-  source?: string;          // 'official' | 'jobboard' | 'inferred'
+  /** 'hr' = direct HR/recruiter, 'general' = company contact/info email */
+  type: 'hr' | 'general';
+  source?: string;          // 'ai' | 'web'
   firstName?: string;
   lastName?: string;
   position?: string;
@@ -29,102 +32,66 @@ export interface HrContact {
 
 interface CacheEntry { contacts: HrContact[]; expiresAt: number }
 const cache = new Map<string, CacheEntry>();
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 h
 
-// ── Noise filtering ────────────────────────────────────────────────────────────
+// ── Classifiers ────────────────────────────────────────────────────────────────
 
-const NOISE_PREFIXES = [
-  'noreply', 'no-reply', 'mailer', 'bounce', 'postmaster',
-  'info', 'contact', 'support', 'help', 'hello', 'sales',
-  'marketing', 'news', 'newsletter', 'admin', 'webmaster',
-  'feedback', 'team', 'service', 'billing', 'accounts',
-  'privacy', 'legal', 'press', 'media', 'pr@', 'do-not-reply',
-  'donotreply', 'unsubscribe', 'abuse',
+const HR_PREFIXES = [
+  'hr', 'recruit', 'talent', 'people', 'hiring',
+  'career', 'careers', 'job', 'jobs', 'hrd', 'humanresource',
 ];
 
-const NOISE_DOMAINS = [
+/** Emails that are completely useless (bounce, spam traps, search engines) */
+const ALWAYS_NOISE: string[] = [
+  'noreply', 'no-reply', 'mailer', 'bounce', 'postmaster',
+  'unsubscribe', 'abuse', 'do-not-reply', 'donotreply',
+  'error', 'daemon',
+];
+
+const NOISE_DOMAINS: string[] = [
   'example.com', 'test.com', 'sentry.io', 'w3.org', 'schema.org',
   'google.com', 'gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com',
   'facebook.com', 'twitter.com', 'linkedin.com',
+  'duckduckgo.com',
+  'jobthai.com', 'jobsdb.com', 'jobbkk.com', 'jobtopgun.com',
+  'seekasia.com', 'monster.com', 'jobstreet.com', 'glassdoor.com',
+  'indeed.com', 'jobsth.com', 'blognone.com',
 ];
 
-const HR_PREFIXES = [
-  'hr', 'recruit', 'talent', 'people', 'hiring', 'career',
-  'job', 'staff', 'personnel', 'human', 'hrd',
-];
-
-const JOB_BOARD_DOMAINS = [
-  'jobthai', 'jobsdb', 'linkedin', 'glassdoor', 'indeed', 'jobsth',
-  'jobbkk', 'jobtopgun', 'seekasia', 'monster', 'jobstreet',
+/** General contact prefixes — valid as fallback, not ideal as primary HR */
+const GENERAL_PREFIXES = [
+  'contact', 'info', 'hello', 'hi', 'team', 'support',
+  'service', 'help', 'office', 'admin', 'mail',
 ];
 
 const EMAIL_RE = /\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}\b/g;
+const PHONE_RE = /(?:\+66[\s\-]?|0)[0-9]{1,2}[\s\-]?[0-9]{3,4}[\s\-]?[0-9]{4}/g;
 
-// ── Helpers ────────────────────────────────────────────────────────────────────
-
-function isNoise(email: string): boolean {
+function classifyEmail(email: string): 'hr' | 'general' | 'noise' {
   const lower = email.toLowerCase();
-  if (NOISE_DOMAINS.some((d) => lower.endsWith(`@${d}`))) return true;
-  if (NOISE_PREFIXES.some((p) => lower.startsWith(p) || lower.includes(`@${p}`))) return true;
-  if (lower.includes('example') || lower.includes('@test.')) return true;
-  return false;
+  const localPart = lower.split('@')[0] ?? '';
+  const domain = lower.split('@')[1] ?? '';
+
+  // Always discard
+  if (NOISE_DOMAINS.some((d) => domain === d)) return 'noise';
+  if (ALWAYS_NOISE.some((p) => localPart === p || localPart.startsWith(p + '.'))) return 'noise';
+  if (lower.includes('example') || lower.includes('@test.')) return 'noise';
+
+  // HR / recruiter
+  if (HR_PREFIXES.some((p) => localPart === p || localPart.startsWith(p))) return 'hr';
+
+  // General company contact
+  if (GENERAL_PREFIXES.some((p) => localPart === p || localPart.startsWith(p))) return 'general';
+
+  // Named person email (firstname.lastname@company.com) → treat as general
+  if (/^[a-z]+[._][a-z]+$/.test(localPart)) return 'general';
+
+  return 'general'; // unknown but valid → keep as general
 }
 
-function isJobBoardDomain(domain: string): boolean {
-  return JOB_BOARD_DOMAINS.some((d) => domain.includes(d));
-}
+// ── DuckDuckGo fallback ────────────────────────────────────────────────────────
 
-function extractDomain(url: string): string | null {
-  try {
-    const u = new URL(url.startsWith('http') ? url : `https://${url}`);
-    return u.hostname.replace(/^www\./, '');
-  } catch {
-    return null;
-  }
-}
-
-/** Guess email naming pattern from a list of emails on a known domain */
-function detectPattern(emails: string[], domain: string): string | null {
-  const local = emails
-    .filter((e) => e.endsWith(`@${domain}`))
-    .map((e) => e.split('@')[0]);
-
-  if (local.length === 0) return null;
-
-  // Check for firstname.lastname pattern
-  const dotPattern = local.filter((l) => /^[a-z]+\.[a-z]+$/.test(l));
-  if (dotPattern.length > 0) return 'firstname.lastname';
-
-  // Check for f.lastname pattern
-  const fLast = local.filter((l) => /^[a-z]\.[a-z]+$/.test(l));
-  if (fLast.length > 0) return 'f.lastname';
-
-  // Check for firstnamelastname (no separator)
-  const noSep = local.filter((l) => /^[a-z]{4,}$/.test(l) && !HR_PREFIXES.includes(l));
-  if (noSep.length > 0) return 'firstlast';
-
-  return null;
-}
-
-/** Generate HR email guesses based on detected pattern */
-function generatePatternEmails(pattern: string, domain: string): string[] {
-  const hrNames = [
-    { first: 'hr', last: '' },
-    { first: 'recruit', last: '' },
-    { first: 'talent', last: '' },
-    { first: 'career', last: '' },
-  ];
-
-  if (pattern === 'firstname.lastname') {
-    return [`hr.team@${domain}`, `recruit.team@${domain}`];
-  }
-  return hrNames
-    .map((n) => n.last ? `${n.first}@${domain}` : `${n.first}@${domain}`)
-    .slice(0, 2);
-}
-
-/** Make a DDG HTML search and extract emails */
-async function ddgSearch(query: string): Promise<{ emails: string[]; urls: string[] }> {
+async function ddgSearch(query: string): Promise<{ emails: string[]; phones: string[] }> {
   try {
     const { data: html } = await axios.get('https://html.duckduckgo.com/html/', {
       params: { q: query },
@@ -136,20 +103,12 @@ async function ddgSearch(query: string): Promise<{ emails: string[]; urls: strin
       },
       timeout: 12000,
     });
-
-    const emails = [...(html as string).matchAll(EMAIL_RE)].map((m) => m[0].toLowerCase());
-
-    // Extract result URLs for domain discovery
-    const urlRe = /href="(https?:\/\/[^"&]+)"/g;
-    const urls: string[] = [];
-    let m: RegExpExecArray | null;
-    while ((m = urlRe.exec(html as string)) !== null) {
-      urls.push(m[1]);
-    }
-
-    return { emails, urls: [...new Set(urls)] };
+    const text = html as string;
+    const emails = [...text.matchAll(EMAIL_RE)].map((m) => m[0].toLowerCase());
+    const phones = [...text.matchAll(PHONE_RE)].map((m) => m[0].replace(/\s/g, ''));
+    return { emails: [...new Set(emails)], phones: [...new Set(phones)] };
   } catch {
-    return { emails: [], urls: [] };
+    return { emails: [], phones: [] };
   }
 }
 
@@ -159,9 +118,10 @@ async function ddgSearch(query: string): Promise<{ emails: string[]; urls: strin
 export class HrEmailService {
   private readonly logger = new Logger(HrEmailService.name);
 
+  constructor(private readonly config: ConfigService) {}
+
   async lookup(companyName: string): Promise<HrContact[]> {
     const key = companyName.trim().toLowerCase();
-
     const cached = cache.get(key);
     if (cached && Date.now() < cached.expiresAt) return cached.contacts;
 
@@ -175,150 +135,269 @@ export class HrEmailService {
       .replace(/บริษัท|จำกัด|มหาชน|\(มหาชน\)|\s+/g, ' ')
       .trim();
 
-    this.logger.log(`[HrEmail] Starting pipeline for "${clean}"`);
+    this.logger.log(`[HrEmail] Looking up: "${clean}"`);
 
-    // ── Step 1: Domain discovery ──────────────────────────────────────────────
-    let officialDomain: string | null = null;
+    // Step 1: Ask AI
+    const aiContacts = await this.askAI(clean);
+    if (aiContacts.length > 0) {
+      this.logger.log(
+        `[HrEmail] AI → ${aiContacts.length} contacts ` +
+        `(hr: ${aiContacts.filter(c => c.type === 'hr').length}, ` +
+        `general: ${aiContacts.filter(c => c.type === 'general').length}, ` +
+        `phones: ${aiContacts.filter(c => c.phone).length}, ` +
+        `websites: ${aiContacts.filter(c => c.website).length})`,
+      );
+      return this.rankContacts(aiContacts);
+    }
+
+    // Step 2: DDG web scraping
+    this.logger.log(`[HrEmail] AI found nothing — trying DDG for "${clean}"`);
+    const webContacts = await this.scrapeWeb(clean);
+    this.logger.log(`[HrEmail] DDG → ${webContacts.length} contacts for "${clean}"`);
+    return this.rankContacts(webContacts);
+  }
+
+  // ── AI lookup ─────────────────────────────────────────────────────────────────
+  // Uses Perplexity Sonar (web search) as primary — it can actually browse the
+  // company website and job boards in real time.
+  // Falls back to the configured AI_MODEL (no web access) if Sonar fails/unavailable.
+
+  private async askAI(companyName: string): Promise<HrContact[]> {
+    const apiKey = (
+      this.config.get<string>('OPENROUTER_KEY') ??
+      this.config.get<string>('OPENROUTER_API_KEY') ?? ''
+    ).trim();
+
+    if (!apiKey || apiKey.startsWith('your-')) return [];
+
+    const headers = {
+      Authorization: `Bearer ${apiKey}`,
+      'HTTP-Referer': this.config.get('BASEURL') ?? 'https://jobai.com',
+      'X-Title': 'JobAI-HREmail',
+    };
+
+    // Try Perplexity Sonar first (has real-time internet search)
+    const sonarResult = await this.callModel(
+      'perplexity/sonar',
+      companyName,
+      headers,
+      true, // isSearchModel
+    );
+    if (sonarResult.length > 0) return sonarResult;
+
+    // Fallback: regular model (uses training data only — less reliable for emails)
+    const fallbackModel = this.config.get<string>('AI_MODEL') ?? 'google/gemini-2.0-flash-001';
+    this.logger.warn(`[HrEmail] Perplexity returned nothing — trying ${fallbackModel}`);
+    return this.callModel(fallbackModel, companyName, headers, false);
+  }
+
+  private async callModel(
+    model: string,
+    companyName: string,
+    headers: Record<string, string>,
+    isSearchModel: boolean,
+  ): Promise<HrContact[]> {
+    const systemPrompt = isSearchModel
+      ? `You are a company contact finder. Search the internet for ALL contact information of the given Thai company that can be used to apply for a job.
+IMPORTANT:
+- Search the company's official website, careers page, LinkedIn, and job boards.
+- Find: HR/recruitment emails, general contact emails, phone numbers, and career/application websites.
+- Return ONLY a raw JSON array (no markdown, no text outside the array).
+- Each item must have at least one of: email, phone, or website.
+- Schema: {"email":"...","phone":"...","website":"...","type":"hr"|"general","confidence":0.0-1.0,"position":"..."}
+  - "hr" = direct HR/recruitment/talent contact
+  - "general" = general company contact (contact@, info@, main office phone, etc.)
+  - Omit fields that are not found (do not set null/empty string).
+  - phone: Thai format, e.g. "02-123-4567" or "+66 2 123 4567"
+  - website: full URL of careers page or job application page
+- If you find nothing verifiable after searching, return exactly: []
+- DO NOT invent or guess — only return what you actually found on the web.`
+      : `You are a company contact finder for Thai companies.
+Return ONLY a raw JSON array of contact info you are CERTAIN about from your training data.
+Schema: {"email":"...","phone":"...","website":"...","type":"hr"|"general","confidence":0.0-1.0}
+Include any combination of email, phone number, or career website. Omit fields you don't know.
+If you are not sure about anything, return []. Never guess or hallucinate.`;
+
+    const userMsg = isSearchModel
+      ? `Search and find ALL contact information (emails, phone numbers, career website) for this Thai company: "${companyName}". Include anything useful for job applications.`
+      : `Find contact info (emails, phone, career website) for: "${companyName}" (Thailand). Only return what you know for certain.`;
+
     try {
-      const { urls } = await ddgSearch(`"${clean}" official website`);
-      officialDomain = this.findOfficialDomain(clean, urls);
-      if (officialDomain) {
-        this.logger.log(`[HrEmail] Domain discovered: ${officialDomain}`);
+      const res = await axios.post(
+        'https://openrouter.ai/api/v1/chat/completions',
+        {
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userMsg },
+          ],
+          max_tokens: 600,
+          temperature: 0.1,
+        },
+        { headers, timeout: 25000 },
+      );
+
+      const raw: string = res.data?.choices?.[0]?.message?.content ?? '';
+      this.logger.log(`[HrEmail] ${model} raw response: ${raw.slice(0, 200)}`);
+      return this.parseAIResponse(raw);
+    } catch (err: any) {
+      this.logger.warn(`[HrEmail] ${model} failed: ${err.message}`);
+      return [];
+    }
+  }
+
+  private parseAIResponse(raw: string): HrContact[] {
+    try {
+      const cleaned = raw
+        .replace(/```json\s*/gi, '')
+        .replace(/```\s*/g, '')
+        .trim();
+
+      const start = cleaned.indexOf('[');
+      const end = cleaned.lastIndexOf(']');
+      if (start === -1 || end === -1) return [];
+
+      const arr: any[] = JSON.parse(cleaned.slice(start, end + 1));
+      if (!Array.isArray(arr)) return [];
+
+      const contacts: HrContact[] = [];
+      for (const item of arr) {
+        const hasEmail = typeof item?.email === 'string' && item.email.includes('@');
+        const hasPhone = typeof item?.phone === 'string' && item.phone.trim().length > 0;
+        const hasWebsite = typeof item?.website === 'string' && item.website.trim().length > 0;
+        if (!hasEmail && !hasPhone && !hasWebsite) continue;
+
+        let emailClassification: 'hr' | 'general' | 'noise' = 'general';
+        let email: string | undefined;
+        if (hasEmail) {
+          email = item.email.toLowerCase().trim();
+          emailClassification = classifyEmail(email as string);
+          if (emailClassification === 'noise') email = undefined;
+        }
+
+        if (!email && !hasPhone && !hasWebsite) continue;
+
+        const declaredType = item.type === 'hr' ? 'hr' : 'general';
+        const inferredType = email ? (emailClassification === 'hr' ? 'hr' : 'general') : 'general';
+
+        contacts.push({
+          ...(email ? { email } : {}),
+          ...(hasPhone ? { phone: item.phone.trim() } : {}),
+          ...(hasWebsite ? { website: item.website.trim() } : {}),
+          type: item.type === 'hr' ? 'hr' : (inferredType === 'hr' ? 'hr' : declaredType),
+          confidence: typeof item.confidence === 'number' ? item.confidence : 0.7,
+          source: 'ai',
+          position: item.position ?? undefined,
+        });
       }
+      return contacts.slice(0, 8);
     } catch {
-      // continue without domain
+      return [];
     }
+  }
 
-    // Add small delay between searches to be polite
-    await new Promise((r) => setTimeout(r, 800));
+  // ── DDG web scraping fallback ─────────────────────────────────────────────────
 
-    // ── Step 2: Multi-query email scraping ───────────────────────────────────
-    const allEmailSources: Array<{ email: string; fromUrl?: string }> = [];
-
+  private async scrapeWeb(companyName: string): Promise<HrContact[]> {
     const queries = [
-      `"${clean}" HR email recruiter Thailand`,
-      `"${clean}" สมัครงาน ติดต่อ hr อีเมล`,
+      `"${companyName}" HR email recruiter Thailand`,
+      `"${companyName}" สมัครงาน ติดต่อ hr อีเมล เบอร์โทร`,
+      `"${companyName}" contact email phone`,
     ];
-    if (officialDomain) {
-      queries.push(`site:${officialDomain} contact OR careers OR hr`);
-    }
+
+    const seenEmails = new Set<string>();
+    const seenPhones = new Set<string>();
+    const contacts: HrContact[] = [];
 
     for (const q of queries) {
       await new Promise((r) => setTimeout(r, 600));
-      const { emails } = await ddgSearch(q);
+      const { emails, phones } = await ddgSearch(q);
+
       for (const email of emails) {
-        allEmailSources.push({ email });
+        if (seenEmails.has(email)) continue;
+        const classification = classifyEmail(email);
+        if (classification === 'noise') continue;
+        seenEmails.add(email);
+        contacts.push({
+          email,
+          type: classification,
+          confidence: classification === 'hr' ? 0.65 : 0.45,
+          source: 'web',
+        });
+      }
+
+      for (const phone of phones) {
+        if (seenPhones.has(phone)) continue;
+        seenPhones.add(phone);
+        contacts.push({
+          phone,
+          type: 'general',
+          confidence: 0.4,
+          source: 'web',
+        });
       }
     }
 
-    this.logger.log(`[HrEmail] "${clean}" → ${allEmailSources.length} raw emails collected`);
-
-    // ── Step 3: Classify and score ────────────────────────────────────────────
-    const seen = new Set<string>();
-    const contacts: HrContact[] = [];
-
-    for (const { email } of allEmailSources) {
-      if (seen.has(email) || isNoise(email)) continue;
-      seen.add(email);
-
-      const domain = email.split('@')[1] ?? '';
-      let confidence: number;
-      let source: HrContact['source'];
-
-      if (officialDomain && domain === officialDomain) {
-        confidence = 0.9;
-        source = 'official';
-      } else if (isJobBoardDomain(domain)) {
-        confidence = 0.6;
-        source = 'jobboard';
-      } else {
-        confidence = 0.65;
-        source = 'jobboard';
-      }
-
-      contacts.push({ email, confidence, source });
-    }
-
-    // ── Step 4: Pattern detection + inference ─────────────────────────────────
-    if (officialDomain) {
-      const officialEmails = contacts
-        .filter((c) => c.source === 'official')
-        .map((c) => c.email);
-
-      const pattern = detectPattern(officialEmails, officialDomain);
-      if (pattern && officialEmails.length < 3) {
-        const inferred = generatePatternEmails(pattern, officialDomain);
-        for (const email of inferred) {
-          if (!seen.has(email)) {
-            seen.add(email);
-            contacts.push({ email, confidence: 0.4, source: 'inferred' });
-          }
-        }
-      }
-
-      // If no official email found but domain is known, add generic HR emails
-      if (officialEmails.length === 0 && officialDomain) {
-        const generics = HR_PREFIXES.slice(0, 3).map((p) => `${p}@${officialDomain}`);
-        for (const email of generics) {
-          if (!seen.has(email)) {
-            seen.add(email);
-            contacts.push({ email, confidence: 0.35, source: 'inferred' });
-          }
-        }
-      }
-    }
-
-    // ── Step 5: Prefer HR-prefixed, sort by confidence, cap at 5 ─────────────
-    const hrFirst = contacts.filter((c) =>
-      HR_PREFIXES.some((p) => c.email.split('@')[0].startsWith(p)),
-    );
-    const others = contacts.filter(
-      (c) => !HR_PREFIXES.some((p) => c.email.split('@')[0].startsWith(p)),
-    );
-
-    const sorted = [...hrFirst, ...others]
-      .sort((a, b) => b.confidence - a.confidence)
-      .slice(0, 5);
-
-    this.logger.log(
-      `[HrEmail] "${clean}" → ${sorted.length} final contacts` +
-      (sorted.length > 0 ? ` (best: ${sorted[0].email} @ ${sorted[0].confidence})` : ''),
-    );
-
-    return sorted;
+    return contacts;
   }
 
-  /** Pick the most likely official company domain from a list of URLs */
-  private findOfficialDomain(company: string, urls: string[]): string | null {
-    const cleanCompany = company
-      .toLowerCase()
-      .replace(/[^a-z0-9]/g, '')
-      .slice(0, 20);
+  // ── Deduplicate + rank ────────────────────────────────────────────────────────
+  // Rules:
+  //   - Deduplicate emails exactly, phones by normalized digits, websites by domain
+  //   - Max 3 email results + 1 phone + 1 website = max 5 total
+  //   - HR emails first, then general emails, then phone, then website
 
-    // Skip social/job board/search engine URLs
-    const skipDomains = [
-      'facebook.com', 'twitter.com', 'linkedin.com', 'instagram.com',
-      'youtube.com', 'google.com', 'bing.com', 'duckduckgo.com',
-      'wikipedia.org', 'pantip.com', 'wongnai.com', 'reviewdb.com',
-      ...JOB_BOARD_DOMAINS,
-    ];
+  private rankContacts(contacts: HrContact[]): HrContact[] {
+    const seenEmails  = new Set<string>();
+    const seenPhones  = new Set<string>();
+    const seenDomains = new Set<string>();
 
-    const candidates: string[] = [];
-    for (const url of urls) {
-      const domain = extractDomain(url);
-      if (!domain) continue;
-      if (skipDomains.some((s) => domain.includes(s))) continue;
-      candidates.push(domain);
+    const hrEmails:      HrContact[] = [];
+    const generalEmails: HrContact[] = [];
+    let   phone:         HrContact | null = null;
+    let   website:       HrContact | null = null;
+
+    // Sort by confidence before deduplicating so highest-confidence wins
+    const sorted = [...contacts].sort((a, b) => b.confidence - a.confidence);
+
+    for (const c of sorted) {
+      if (c.email) {
+        if (seenEmails.has(c.email)) continue;
+        seenEmails.add(c.email);
+        if (c.type === 'hr') hrEmails.push(c);
+        else                  generalEmails.push(c);
+      } else if (c.phone) {
+        const digits = c.phone.replace(/\D/g, '');
+        if (seenPhones.has(digits)) continue;
+        seenPhones.add(digits);
+        if (!phone) phone = c; // keep only best phone
+      } else if (c.website) {
+        // Normalize to domain only
+        const domain = this.extractDomain(c.website);
+        if (!domain || seenDomains.has(domain)) continue;
+        seenDomains.add(domain);
+        if (!website) website = { ...c, website: domain }; // store domain as canonical
+      }
     }
 
-    if (candidates.length === 0) return null;
+    const result: HrContact[] = [
+      ...hrEmails.slice(0, 3),
+      ...generalEmails.slice(0, Math.max(0, 3 - hrEmails.length)),
+    ];
+    if (phone)   result.push(phone);
+    if (website) result.push(website);
 
-    // Prefer domain that contains part of the company name
-    const nameParts = cleanCompany.split('').slice(0, 5).join('');
-    const matching = candidates.find((d) => d.replace(/[^a-z0-9]/g, '').includes(nameParts));
-    if (matching) return matching;
+    return result;
+  }
 
-    // Otherwise return the first non-skipped domain
-    return candidates[0] ?? null;
+  private extractDomain(url: string): string | null {
+    try {
+      const u = new URL(url.startsWith('http') ? url : `https://${url}`);
+      return u.hostname.replace(/^www\./, '');
+    } catch {
+      // Not a full URL — might already be just a domain
+      const plain = url.replace(/^https?:\/\//i, '').replace(/^www\./i, '').split('/')[0];
+      return plain.includes('.') ? plain : null;
+    }
   }
 }

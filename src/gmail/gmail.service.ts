@@ -1,4 +1,4 @@
-import { Injectable, Logger, UnauthorizedException } from '@nestjs/common';
+import { Injectable, Logger, UnauthorizedException, BadRequestException } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
@@ -15,6 +15,17 @@ export class GmailService {
     private readonly tokenRepo: Repository<GmailToken>,
   ) {}
 
+  /** Throws BadRequestException if Google OAuth env vars are not configured */
+  private assertGoogleConfigured(): void {
+    const clientId = this.config.get<string>('GOOGLE_CLIENT_ID') ?? '';
+    const clientSecret = this.config.get<string>('GOOGLE_CLIENT_SECRET') ?? '';
+    if (!clientId || clientId.startsWith('your-') || !clientSecret || clientSecret.startsWith('your-')) {
+      throw new BadRequestException(
+        'Google OAuth ยังไม่ได้ตั้งค่า — กรุณาเพิ่ม GOOGLE_CLIENT_ID และ GOOGLE_CLIENT_SECRET ใน .env แล้ว restart backend',
+      );
+    }
+  }
+
   private getOAuth2Client() {
     return new google.auth.OAuth2(
       this.config.get('GOOGLE_CLIENT_ID'),
@@ -24,6 +35,7 @@ export class GmailService {
   }
 
   getAuthUrl(userId: string): string {
+    this.assertGoogleConfigured();
     const oauth2 = this.getOAuth2Client();
     return oauth2.generateAuthUrl({
       access_type: 'offline',

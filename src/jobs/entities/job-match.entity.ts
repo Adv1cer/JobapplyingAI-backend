@@ -90,6 +90,27 @@ export class JobMatch {
   @Column({ nullable: true })
   gmailDraftId: string;
 
+  @Column({ default: false })
+  remote: boolean;
+
+  /** Actual date the job was posted on the source website (not when we scraped it) */
+  @Column({ nullable: true, type: 'timestamptz' })
+  postedAt?: Date;
+
+  /** True while this match is actively being re-scored in a reanalyze job.
+   *  Set to true before each AI batch, false after completion.
+   *  Lets the frontend show a skeleton/loading state per card. */
+  @Column({ default: false })
+  isReanalyzing: boolean;
+
+  /** True when resume was updated after this match was scored → score may be outdated */
+  @Column({ default: false })
+  isStale: boolean;
+
+  /** True when the original job listing has likely expired (>30 days old) */
+  @Column({ default: false })
+  isExpired: boolean;
+
   @CreateDateColumn()
   @Index()
   scrapedAt: Date;

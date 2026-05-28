@@ -1,6 +1,6 @@
 import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, LessThan, Not, Repository } from 'typeorm';
 import { JobMatch } from './entities/job-match.entity';
 import { SavedJob } from './entities/saved-job.entity';
 import { Job } from './entities/job.entity';
@@ -24,20 +24,43 @@ export class JobsService {
   ) {}
 
   async getDashboardStats(userId: string) {
+    // Exclude expired jobs from active counts
     const [totalScanned, aiMatches, applied, interviewRequests] = await Promise.all([
-      this.matchRepo.count({ where: { userId } }),
-      this.matchRepo.count({ where: { userId, status: 'pending' } }),
+      this.matchRepo.count({ where: { userId, isExpired: false } }),
+      this.matchRepo.count({ where: { userId, status: 'pending', isExpired: false } }),
       this.matchRepo.count({ where: { userId, status: 'applied' } }),
       this.matchRepo.count({ where: { userId, status: 'interview' } }),
     ]);
     return { totalScanned, aiMatches, pendingReview: aiMatches, applied, interviewRequests };
   }
 
-  async getJobMatches(userId: string): Promise<JobMatch[]> {
-    return this.matchRepo.find({
-      where: { userId },
+  /** Paginated job matches. Expired jobs are excluded by default. */
+  async getJobMatches(
+    userId: string,
+    page = 1,
+    limit = 10,
+    includeExpired = false,
+  ): Promise<{ jobs: JobMatch[]; total: number; page: number; hasMore: boolean }> {
+    const where: any = { userId };
+    if (!includeExpired) where.isExpired = false;
+
+    const [jobs, total] = await this.matchRepo.findAndCount({
+      where,
       order: { matchScore: 'DESC', scrapedAt: 'DESC' },
+      skip: (page - 1) * limit,
+      take: limit,
     });
+    return { jobs, total, page, hasMore: page * limit < total };
+  }
+
+  /** After a fresh scan, mark job_matches older than 30 days as expired. */
+  async markExpiredOldJobs(userId: string): Promise<void> {
+    const cutoff = new Date();
+    cutoff.setDate(cutoff.getDate() - 30);
+    await this.matchRepo.update(
+      { userId, isExpired: false, scrapedAt: LessThan(cutoff) },
+      { isExpired: true },
+    );
   }
 
   async confirmApplication(userId: string, jobId: string): Promise<JobMatch> {

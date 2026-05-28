@@ -81,6 +81,7 @@ const JOB_TYPE_ID: Record<string, string> = {
 };
 
 // The exact GraphQL query extracted from pages/jobs-*.js bundle
+// We request all date-related fields; the API returns what it has.
 const SEARCH_JOBS_QUERY = `
 query ($searchJobsFilter: JobsSearchFilter, $orderBy: JobOrderBy, $staticDataVersion: StaticDataVersion) {
   searchJobs(filter: $searchJobsFilter, orderBy: $orderBy, staticDataVersion: $staticDataVersion) {
@@ -99,6 +100,10 @@ query ($searchJobsFilter: JobsSearchFilter, $orderBy: JobOrderBy, $staticDataVer
         jobType { id name }
         region { id name }
         tags
+        postedAt
+        createdAt
+        openDate
+        startDate
         updatedAt
       }
     }
@@ -144,6 +149,22 @@ function buildFilter(
   return f;
 }
 
+/**
+ * Pick the best "actual posting date" from a JobThai item.
+ * Priority: postedAt → openDate → startDate → createdAt → updatedAt (last resort)
+ * updatedAt is least preferred because companies can edit their posts
+ * days/weeks after the original posting date.
+ */
+function parseJobThaiDate(it: any): string | undefined {
+  const candidates = [it.postedAt, it.openDate, it.startDate, it.createdAt, it.updatedAt];
+  for (const raw of candidates) {
+    if (!raw) continue;
+    const d = new Date(raw);
+    if (!isNaN(d.getTime())) return d.toISOString();
+  }
+  return undefined;
+}
+
 function normalizeItem(it: any): NormalizedJob | null {
   const id = it.id;
   if (!id) return null;
@@ -173,7 +194,7 @@ function normalizeItem(it: any): NormalizedJob | null {
     remote: false, // JobThai doesn't have explicit remote flag in list view
     url: `https://www.jobthai.com/th/find-jobs/${id}`,
     hrEmails: [],
-    postedAt: it.updatedAt ? new Date(it.updatedAt).toISOString() : undefined,
+    postedAt: parseJobThaiDate(it),
     createdAt: new Date(),
   };
 }

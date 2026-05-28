@@ -18,7 +18,6 @@ import { Repository } from 'typeorm';
 import { JobMatch } from '../jobs/entities/job-match.entity';
 
 @Controller('gmail')
-@UseGuards(JwtAuthGuard)
 export class GmailController {
   constructor(
     private readonly gmailService: GmailService,
@@ -27,6 +26,7 @@ export class GmailController {
   ) {}
 
   @Get('auth')
+  @UseGuards(JwtAuthGuard)
   getAuthUrl(@Req() req: any) {
     const url = this.gmailService.getAuthUrl(req.user.id);
     return { url };
@@ -40,11 +40,13 @@ export class GmailController {
   }
 
   @Get('status')
+  @UseGuards(JwtAuthGuard)
   async getStatus(@Req() req: any) {
     return this.gmailService.isConnected(req.user.id);
   }
 
   @Post('draft')
+  @UseGuards(JwtAuthGuard)
   async createDraft(@Req() req: any, @Body() dto: CreateDraftDto) {
     const { draftId, threadId } = await this.gmailService.createDraft(
       req.user.id,
@@ -62,6 +64,7 @@ export class GmailController {
   }
 
   @Delete('disconnect')
+  @UseGuards(JwtAuthGuard)
   async disconnect(@Req() req: any) {
     await this.gmailService.disconnect(req.user.id);
     return { message: 'Gmail disconnected' };
