@@ -16,6 +16,7 @@ import { CreateDraftDto } from './dto/create-draft.dto';
 import { InjectRepository } from '@nestjs/typeorm';
 import { Repository } from 'typeorm';
 import { JobMatch } from '../jobs/entities/job-match.entity';
+import { Resume } from '../resume/resume.entity';
 
 @Controller('gmail')
 export class GmailController {
@@ -23,6 +24,8 @@ export class GmailController {
     private readonly gmailService: GmailService,
     @InjectRepository(JobMatch)
     private readonly jobMatchRepo: Repository<JobMatch>,
+    @InjectRepository(Resume)
+    private readonly resumeRepo: Repository<Resume>,
   ) {}
 
   @Get('auth')
@@ -48,19 +51,44 @@ export class GmailController {
   @Post('draft')
   @UseGuards(JwtAuthGuard)
   async createDraft(@Req() req: any, @Body() dto: CreateDraftDto) {
+    // Attach resume PDF if stored
+    const resume = await this.resumeRepo.findOne({ where: { userId: req.user.id } });
+    const attachmentBase64 = resume?.resumeFilePdf ?? undefined;
+    const attachmentName = resume?.resumeFileName ?? undefined;
+
     const { draftId, threadId } = await this.gmailService.createDraft(
       req.user.id,
       dto.to,
       dto.subject,
       dto.body,
+      attachmentBase64,
+      attachmentName,
     );
 
-    // Link draft to job match if provided
     if (dto.jobMatchId) {
-      await this.jobMatchRepo.update(dto.jobMatchId, { gmailDraftId: draftId });
+      await this.jobMatchRepo.update(dto.jobMatchId, {
+        gmailDraftId: draftId,
+        gmailThreadId: threadId,
+        status: 'drafted',
+      });
     }
 
     return { draftId, threadId, message: 'Draft created. Open Gmail to review and send.' };
+  }
+
+  @Post('check-sent')
+  @UseGuards(JwtAuthGuard)
+  async checkSent(@Req() req: any, @Body() body: { jobMatchId: string }) {
+    const job = await this.jobMatchRepo.findOne({
+      where: { id: body.jobMatchId, userId: req.user.id },
+    });
+    if (!job?.gmailThreadId) return { applied: false };
+
+    const sent = await this.gmailService.checkDraftSent(req.user.id, job.gmailThreadId);
+    if (sent && job.status !== 'applied') {
+      await this.jobMatchRepo.update(job.id, { status: 'applied' });
+    }
+    return { applied: sent };
   }
 
   @Delete('disconnect')

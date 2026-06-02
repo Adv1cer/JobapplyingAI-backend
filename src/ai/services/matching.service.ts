@@ -25,7 +25,7 @@ export class MatchingService {
       return this.fallbackAnalysis(job, resume);
     }
 
-    const model = this.config.get<string>('AI_MODEL') ?? 'google/gemini-2.0-flash-001';
+    const model = this.config.get<string>('AI_MODEL') ?? 'google/gemini-flash-1.5';
     const prompt = this.buildMatchPrompt(job, resume);
 
     try {
@@ -230,7 +230,7 @@ Reply with JSON only:
     const edu = (r.education as any[]).slice(0, 2)
       .map((e) => `- ${e.degree ?? ''} ${e.field ?? ''} @ ${e.school ?? ''} (${e.startYear ?? ''}–${e.endYear ?? ''})`)
       .join('\n');
-    return [
+    const parts = [
       `ชื่อ: ${r.firstName ?? ''} ${r.lastName ?? ''}`,
       `โทรศัพท์: ${(r as any).phone ?? '-'}`,
       `อีเมล: ${(r as any).email ?? '-'}`,
@@ -239,6 +239,10 @@ Reply with JSON only:
       `ประสบการณ์:\n${work || '-'}`,
       `ทักษะ: ${r.skills?.join(', ') || '-'}`,
       `ตำแหน่งที่ต้องการ: ${r.desiredPosition ?? '-'}`,
-    ].join('\n');
+    ];
+    if (r.pdfExtractedText) {
+      parts.push(`\n--- เนื้อหาจาก Resume PDF (ใช้เป็นข้อมูลเพิ่มเติมในการวิเคราะห์) ---\n${r.pdfExtractedText.slice(0, 2000)}`);
+    }
+    return parts.join('\n');
   }
 }

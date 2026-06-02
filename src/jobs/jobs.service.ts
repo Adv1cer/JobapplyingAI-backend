@@ -1,6 +1,7 @@
-import { Injectable, NotFoundException } from '@nestjs/common';
+import { Injectable, Logger, NotFoundException } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
 import { In, LessThan, Not, Repository } from 'typeorm';
+import axios from 'axios';
 import { JobMatch } from './entities/job-match.entity';
 import { SavedJob } from './entities/saved-job.entity';
 import { Job } from './entities/job.entity';
@@ -8,8 +9,49 @@ import { CoverLetterService, CoverLetterRequest } from '../ai/services/cover-let
 import { Resume } from '../resume/resume.entity';
 import { HrEmailService, HrContact } from '../scraping/hr-email.service';
 
+const EMAIL_RE = /\b[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,10}\b/g;
+
+/** Scrape HR contact email directly from a JobThai job detail page */
+async function scrapeJobThaiPageEmail(jobUrl: string): Promise<HrContact[]> {
+  try {
+    const { data: html } = await axios.get(jobUrl, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36',
+        'Accept-Language': 'th-TH,th;q=0.9',
+      },
+      timeout: 10000,
+    });
+
+    // Extract emails from full page text
+    const emails: string[] = [...new Set((html as string).match(EMAIL_RE) ?? [])];
+
+    // Prefer trustmail.jobthai.com (company contact proxy) — these are most reliable
+    const contacts: HrContact[] = emails
+      .filter((e) => {
+        const domain = e.split('@')[1]?.toLowerCase() ?? '';
+        // Skip noise but keep trustmail.jobthai.com
+        const noisy = ['gmail.com', 'yahoo.com', 'hotmail.com', 'outlook.com', 'example.com'];
+        return !noisy.includes(domain);
+      })
+      .map((email) => ({
+        email,
+        confidence: email.includes('trustmail.jobthai.com') ? 0.95 : 0.7,
+        type: 'hr' as const,
+        source: 'jobthai-page',
+      }));
+
+    // trustmail first, then others
+    contacts.sort((a, b) => b.confidence - a.confidence);
+    return contacts.slice(0, 3);
+  } catch {
+    return [];
+  }
+}
+
 @Injectable()
 export class JobsService {
+  private readonly logger = new Logger(JobsService.name);
+
   constructor(
     @InjectRepository(JobMatch)
     private readonly matchRepo: Repository<JobMatch>,
@@ -155,11 +197,20 @@ export class JobsService {
     const match = await this.matchRepo.findOne({ where: { id: jobMatchId, userId } });
     if (!match) throw new NotFoundException('Job match not found');
 
-    const contacts = await this.hrEmailService.lookup(match.company);
+    // For JobThai jobs: scrape the detail page first (most reliable — has trustmail proxy email)
+    let contacts: HrContact[] = [];
+    if (match.source === 'JobThai' && match.jobUrl) {
+      contacts = await scrapeJobThaiPageEmail(match.jobUrl);
+      this.logger.log(`[HR] JobThai page scrape for "${match.company}": ${contacts.length} contacts`);
+    }
 
-    // Persist any found emails back to the job record if they're new
+    // Fallback / supplement: AI + web lookup by company name
+    if (contacts.length === 0) {
+      contacts = await this.hrEmailService.lookup(match.company);
+    }
+
     if (contacts.length > 0) {
-      const emails = contacts.map((c) => c.email);
+      const emails = contacts.map((c) => c.email).filter(Boolean) as string[];
       await this.matchRepo.update(jobMatchId, { hrEmails: emails } as any);
     }
 

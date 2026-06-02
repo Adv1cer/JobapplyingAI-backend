@@ -1,7 +1,7 @@
 import { Processor, WorkerHost } from '@nestjs/bullmq';
 import { Logger } from '@nestjs/common';
 import { InjectRepository } from '@nestjs/typeorm';
-import { In, Repository } from 'typeorm';
+import { In, MoreThan, Repository } from 'typeorm';
 import { Job as BullJob } from 'bullmq';
 import { ScanSession } from '../../scan/scan-session.entity';
 import { JobMatch } from '../../jobs/entities/job-match.entity';
@@ -10,6 +10,12 @@ import { CollectorsService } from '../../collectors/collectors.service';
 import { MatchingService } from '../../ai/services/matching.service';
 import { EmbeddingService } from '../../ai/services/embedding.service';
 import { QUEUE_JOB_SYNC } from '../queues.constants';
+
+function parseDate(value: string | undefined | null): Date | undefined {
+  if (!value) return undefined;
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? undefined : d;
+}
 import { sleep } from '../../common/utils/retry.util';
 
 export interface JobSyncPayload {
@@ -60,6 +66,23 @@ export class JobSyncProcessor extends WorkerHost {
     this.logger.log(`[Sync ${sessionId}] Starting for user ${userId}`);
 
     try {
+      // ── Score cache: reuse AI results for jobs seen in the last 7 days ──────────
+      // Build before delete so repeated jobs skip the AI call entirely.
+      const cacheCutoff = new Date(Date.now() - 7 * 24 * 60 * 60 * 1000);
+      const recentMatches = await this.jobMatchRepo.find({
+        where: { userId, status: In(['pending', 'discarded']), scrapedAt: MoreThan(cacheCutoff) },
+        select: ['title', 'company', 'source', 'matchScore', 'missingSkills', 'strengths',
+                 'aiSummary', 'aiReasons', 'coverLetter', 'coverLetterLang'] as any,
+      });
+      const scoreCache = new Map<string, typeof recentMatches[0]>();
+      for (const m of recentMatches) {
+        if (m.matchScore > 0) {
+          const key = `${m.source}:${m.title?.toLowerCase().trim()}:${m.company?.toLowerCase().trim()}`;
+          scoreCache.set(key, m);
+        }
+      }
+      this.logger.log(`[Sync ${sessionId}] Score cache: ${scoreCache.size} recent jobs`);
+
       // Clear old pending/discarded matches for this user
       await this.jobMatchRepo.delete({ userId, status: In(['pending', 'discarded']) });
 
@@ -101,7 +124,7 @@ export class JobSyncProcessor extends WorkerHost {
               resumeName,
               isStale:   false,
               isExpired: false,
-              postedAt:  raw.postedAt ? new Date(raw.postedAt) : undefined,
+              postedAt:  parseDate(raw.postedAt),
             }),
           ).catch(() => null),
         ),
@@ -130,6 +153,18 @@ export class JobSyncProcessor extends WorkerHost {
           const batchResults = await Promise.all(
             batch.map((raw, idx) => {
               const globalIdx = batchStart + idx;
+              const cacheKey = `${raw.source}:${raw.title?.toLowerCase().trim()}:${raw.company?.toLowerCase().trim()}`;
+              const cached = scoreCache.get(cacheKey);
+              if (cached) {
+                return Promise.resolve({
+                  matchScore:    cached.matchScore,
+                  missingSkills: cached.missingSkills ?? [],
+                  strengths:     cached.strengths ?? [],
+                  summary:       cached.aiSummary ?? '',
+                  reasons:       cached.aiReasons ?? [],
+                  coverLetter:   cached.coverLetter ?? '',
+                });
+              }
               if (globalIdx < MAX_AI_JOBS) {
                 return this.matchingService.analyzeMatch(raw, resume).catch((err: any) => {
                   this.logger.warn(`[Sync ${sessionId}] AI failed "${raw.title}": ${err.message}`);

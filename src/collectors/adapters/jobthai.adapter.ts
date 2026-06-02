@@ -12,7 +12,7 @@ import axios from 'axios';
 import { BaseJobAdapter } from './base.adapter';
 import { NormalizedJob } from '../../common/interfaces/job.interface';
 import { ScanFiltersDto } from '../../scan/dto/scan-filters.dto';
-import { sleep } from '../../common/utils/retry.util';
+import { sleep, withRetry } from '../../common/utils/retry.util';
 
 const GQL_URL = 'https://api.jobthai.com/v1/graphql';
 
@@ -100,10 +100,6 @@ query ($searchJobsFilter: JobsSearchFilter, $orderBy: JobOrderBy, $staticDataVer
         jobType { id name }
         region { id name }
         tags
-        postedAt
-        createdAt
-        openDate
-        startDate
         updatedAt
       }
     }
@@ -156,13 +152,9 @@ function buildFilter(
  * days/weeks after the original posting date.
  */
 function parseJobThaiDate(it: any): string | undefined {
-  const candidates = [it.postedAt, it.openDate, it.startDate, it.createdAt, it.updatedAt];
-  for (const raw of candidates) {
-    if (!raw) continue;
-    const d = new Date(raw);
-    if (!isNaN(d.getTime())) return d.toISOString();
-  }
-  return undefined;
+  if (!it.updatedAt) return undefined;
+  const d = new Date(it.updatedAt);
+  return isNaN(d.getTime()) ? undefined : d.toISOString();
 }
 
 function normalizeItem(it: any): NormalizedJob | null {
@@ -192,7 +184,7 @@ function normalizeItem(it: any): NormalizedJob | null {
     salary: it.salary ?? undefined,
     jobType: it.jobType?.name ?? undefined,
     remote: false, // JobThai doesn't have explicit remote flag in list view
-    url: `https://www.jobthai.com/th/find-jobs/${id}`,
+    url: `https://www.jobthai.com/th/job/${id}`,
     hrEmails: [],
     postedAt: parseJobThaiDate(it),
     createdAt: new Date(),
@@ -225,17 +217,21 @@ export class JobThaiAdapter extends BaseJobAdapter {
           total = cached.total;
           fromCache = true;
         } else {
-          const { data: resp } = await axios.post(
-            GQL_URL,
-            {
-              query: SEARCH_JOBS_QUERY,
-              variables: {
-                searchJobsFilter,
-                orderBy: 'UPDATED_AT_DESC',
-                staticDataVersion: {},
+          const { data: resp } = await withRetry(
+            () => axios.post(
+              GQL_URL,
+              {
+                query: SEARCH_JOBS_QUERY,
+                variables: {
+                  searchJobsFilter,
+                  orderBy: 'UPDATED_AT_DESC',
+                  staticDataVersion: {},
+                },
               },
-            },
-            { headers: HEADERS, timeout: 15000 },
+              { headers: HEADERS, timeout: 15000 },
+            ),
+            3,   // max attempts
+            800, // base delay ms (doubles each retry)
           );
 
           if (resp?.errors?.length) {
@@ -277,7 +273,14 @@ export class JobThaiAdapter extends BaseJobAdapter {
         // Polite delay between pages (only when actually calling the API)
         if (!fromCache) await sleep(800);
       } catch (err: any) {
-        this.logger.error(`[JobThai p${page}]: ${err.message}`);
+        const detail = err.response?.data
+          ? JSON.stringify(err.response.data).slice(0, 500)
+          : '';
+        this.logger.error(
+          `[JobThai p${page}]: ${err.message}` +
+          (detail ? ` — ${detail}` : '') +
+          ` | filter: ${cacheKey}`,
+        );
         break;
       }
     }

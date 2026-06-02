@@ -65,6 +65,17 @@ export class Resume {
   @Column({ nullable: true })
   desiredProvince: string;
 
+  /** Base64-encoded PDF file (stored directly in DB for simplicity) */
+  @Column({ type: 'text', nullable: true })
+  resumeFilePdf?: string;
+
+  @Column({ nullable: true })
+  resumeFileName?: string;
+
+  /** Plain text extracted from the uploaded PDF — used in AI matching */
+  @Column({ type: 'text', nullable: true })
+  pdfExtractedText?: string;
+
   @CreateDateColumn()
   createdAt: Date;
 

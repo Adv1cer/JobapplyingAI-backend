@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Post, Put, Request, UseGuards } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Post, Put, Request, UseGuards, BadRequestException } from '@nestjs/common';
 import { ResumeService } from './resume.service';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
@@ -27,5 +27,18 @@ export class ResumeController {
   @Post('reanalyze')
   reanalyze(@Request() req: any) {
     return this.resumeService.queueReanalyze(req.user.id);
+  }
+
+  @Delete('upload-pdf')
+  deletePdf(@Request() req: any) {
+    return this.resumeService.deletePdf(req.user.id);
+  }
+
+  /** Upload PDF resume as base64. Body: { fileBase64: string, fileName: string } */
+  @Post('upload-pdf')
+  async uploadPdf(@Request() req: any, @Body() body: { fileBase64: string; fileName: string }) {
+    if (!body.fileBase64) throw new BadRequestException('fileBase64 is required');
+    const resume = await this.resumeService.savePdf(req.user.id, body.fileBase64, body.fileName ?? 'resume.pdf');
+    return { message: 'Resume PDF saved', fileName: resume.resumeFileName };
   }
 }

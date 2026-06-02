@@ -4,8 +4,16 @@ import { Repository } from 'typeorm';
 import { Job } from '../jobs/entities/job.entity';
 import { NormalizedJob } from '../common/interfaces/job.interface';
 import { ScanFiltersDto } from '../scan/dto/scan-filters.dto';
-import { JobsDBAdapter }  from './adapters/jobsdb.adapter';
-import { JobThaiAdapter } from './adapters/jobthai.adapter';
+import { JobsDBAdapter }    from './adapters/jobsdb.adapter';
+import { JobThaiAdapter }   from './adapters/jobthai.adapter';
+import { JobbkkAdapter }    from './adapters/jobbkk.adapter';
+import { JobTopGunAdapter } from './adapters/jobtopgun.adapter';
+
+function parseDate(value: string | undefined | null): Date | undefined {
+  if (!value) return undefined;
+  const d = new Date(value);
+  return isNaN(d.getTime()) ? undefined : d;
+}
 
 @Injectable()
 export class CollectorsService {
@@ -14,14 +22,18 @@ export class CollectorsService {
   constructor(
     @InjectRepository(Job)
     private readonly jobRepo: Repository<Job>,
-    private readonly jobsdb:   JobsDBAdapter,
-    private readonly jobthai:  JobThaiAdapter,
+    private readonly jobsdb:     JobsDBAdapter,
+    private readonly jobthai:    JobThaiAdapter,
+    private readonly jobbkk:     JobbkkAdapter,
+    private readonly jobtopgun:  JobTopGunAdapter,
   ) {}
 
   async collectAll(filters: ScanFiltersDto): Promise<NormalizedJob[]> {
     const results = await Promise.allSettled([
       this.jobsdb.collect(filters, 3),
       this.jobthai.collect(filters, 3),
+      this.jobbkk.collect(filters, 3),
+      this.jobtopgun.collect(filters, 3),
     ]);
 
     const counts: Record<string, number> = {};
@@ -63,7 +75,7 @@ export class CollectorsService {
             salary: job.salary, jobType: job.jobType,
             remote: job.remote ?? false, url: job.url,
             hrEmails: job.hrEmails ?? [],
-            postedAt: job.postedAt ? new Date(job.postedAt) : undefined,
+            postedAt: parseDate(job.postedAt),
           });
           saved.push(await this.jobRepo.save(entity) as Job);
         }

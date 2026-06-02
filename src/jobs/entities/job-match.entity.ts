@@ -90,6 +90,9 @@ export class JobMatch {
   @Column({ nullable: true })
   gmailDraftId: string;
 
+  @Column({ nullable: true })
+  gmailThreadId: string;
+
   @Column({ default: false })
   remote: boolean;
 

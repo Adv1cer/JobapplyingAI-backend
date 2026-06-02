@@ -62,7 +62,7 @@ function parseNextData(html: string): RawJob[] {
         : undefined,
       jobType: it.jobTypeName ?? it.jobType ?? undefined,
       description: (it.jobDetail ?? it.description ?? it.requirement ?? '').slice(0, 500),
-      url: it.jobUrl ?? it.url ?? (it.jobId ? `${BASE}/th/jobs/${it.jobId}` : BASE),
+      url: it.jobUrl ?? it.url ?? (it.jobId ? `${BASE}/th/job/${it.jobId}` : BASE),
       source: 'JobThai',
       postedAt: it.postDate ?? it.createdDate ?? it.publishedAt,
     })).filter((j) => j.title.length > 2);

@@ -39,7 +39,10 @@ export class GmailService {
     const oauth2 = this.getOAuth2Client();
     return oauth2.generateAuthUrl({
       access_type: 'offline',
-      scope: ['https://www.googleapis.com/auth/gmail.compose'],
+      scope: [
+        'https://www.googleapis.com/auth/gmail.compose',
+        'https://www.googleapis.com/auth/gmail.readonly',
+      ],
       state: userId,
       prompt: 'consent',
     });
@@ -76,11 +79,13 @@ export class GmailService {
     to: string,
     subject: string,
     body: string,
+    attachmentBase64?: string,
+    attachmentName?: string,
   ): Promise<{ draftId: string; threadId: string }> {
     const oauth2 = await this.getAuthedClient(userId);
     const gmail = google.gmail({ version: 'v1', auth: oauth2 });
 
-    const message = this.buildMimeMessage(to, subject, body);
+    const message = this.buildMimeMessage(to, subject, body, attachmentBase64, attachmentName);
     const encoded = Buffer.from(message).toString('base64url');
 
     const res = await gmail.users.drafts.create({
@@ -93,6 +98,27 @@ export class GmailService {
 
     this.logger.log(`Gmail draft created: ${draftId} for user ${userId}`);
     return { draftId, threadId };
+  }
+
+  /**
+   * Check if a Gmail draft has been sent by looking for the thread in the SENT label.
+   * Returns true if the email was sent.
+   */
+  async checkDraftSent(userId: string, threadId: string): Promise<boolean> {
+    try {
+      const oauth2 = await this.getAuthedClient(userId);
+      const gmail = google.gmail({ version: 'v1', auth: oauth2 });
+      const res = await gmail.users.threads.get({
+        userId: 'me',
+        id: threadId,
+        format: 'metadata',
+        metadataHeaders: ['Subject'],
+      });
+      const labels = res.data.messages?.flatMap((m) => m.labelIds ?? []) ?? [];
+      return labels.includes('SENT');
+    } catch {
+      return false;
+    }
   }
 
   async isConnected(userId: string): Promise<{ connected: boolean; email?: string }> {
@@ -129,15 +155,52 @@ export class GmailService {
     return oauth2;
   }
 
-  private buildMimeMessage(to: string, subject: string, body: string): string {
-    const lines = [
+  private buildMimeMessage(
+    to: string,
+    subject: string,
+    body: string,
+    attachmentBase64?: string,
+    attachmentName?: string,
+  ): string {
+    // RFC 2047: encode non-ASCII subject as base64 word
+    const encodedSubject = `=?UTF-8?B?${Buffer.from(subject, 'utf-8').toString('base64')}?=`;
+    const encodedBody = Buffer.from(body, 'utf-8').toString('base64');
+
+    if (!attachmentBase64) {
+      return [
+        `To: ${to}`,
+        `Subject: ${encodedSubject}`,
+        'MIME-Version: 1.0',
+        'Content-Type: text/plain; charset=UTF-8',
+        'Content-Transfer-Encoding: base64',
+        '',
+        encodedBody,
+      ].join('\r\n');
+    }
+
+    // Multipart/mixed — body + resume attachment
+    const boundary = `----=_Part_${Date.now()}`;
+    const fname = attachmentName ?? 'resume.pdf';
+    return [
       `To: ${to}`,
-      `Subject: ${subject}`,
+      `Subject: ${encodedSubject}`,
       'MIME-Version: 1.0',
-      'Content-Type: text/plain; charset=UTF-8',
+      `Content-Type: multipart/mixed; boundary="${boundary}"`,
       '',
-      body,
-    ];
-    return lines.join('\r\n');
+      `--${boundary}`,
+      'Content-Type: text/plain; charset=UTF-8',
+      'Content-Transfer-Encoding: base64',
+      '',
+      encodedBody,
+      '',
+      `--${boundary}`,
+      `Content-Type: application/pdf; name="${fname}"`,
+      'Content-Transfer-Encoding: base64',
+      `Content-Disposition: attachment; filename="${fname}"`,
+      '',
+      attachmentBase64,
+      '',
+      `--${boundary}--`,
+    ].join('\r\n');
   }
 }
